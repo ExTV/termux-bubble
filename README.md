@@ -28,16 +28,23 @@ You also need a **DeepSeek API key** from <https://platform.deepseek.com>.
 
 ## Setup
 
-1. Grant Termux:GUI the **"Display over other apps"** permission (the script opens this
+1. Clone the repo:
+
+   ```sh
+   git clone https://github.com/ExTV/termux-bubble
+   cd termux-bubble
+   ```
+
+2. Grant Termux:GUI the **"Display over other apps"** permission (the script opens this
    settings screen automatically if it's missing).
-2. Run it:
+3. Run it:
 
    ```sh
    chmod +x deepseek-bubble.sh
    ./deepseek-bubble.sh
    ```
 
-3. On first launch, paste your API key and tap **Save key**. It's stored privately at
+4. On first launch, paste your API key and tap **Save key**. It's stored privately at
    `~/.config/deepseek-bubble/config` (or set `DEEPSEEK_API_KEY` in the environment to
    skip this).
 
