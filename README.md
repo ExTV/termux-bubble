@@ -54,8 +54,13 @@ You also need a **DeepSeek API key** from <https://platform.deepseek.com>.
 - **Clipboard actions** — copy text, then tap *Trans / Sum / Expl / Fix / Reply*.
 - **Chat** — type a request and **Send**. The model can run bash commands on your phone
   (read files, fetch things, run programs) to complete the task.
+- While it's working, **Send** turns into **Stop** — tap it to cancel the current run.
+  Collapse, drag, Copy/Speak and quit keep working during a run.
 - **Copy / Speak** the last answer, **Reset** the conversation, **▽** collapse, **✕** quit.
+
+The default model is `deepseek-chat`; set `DEEPSEEK_MODEL=<model>` in
+`~/.config/deepseek-bubble/config` to use a different one.
 
 ## License
 
-See [LICENSE](LICENSE).
+GPL-3.0 — see [LICENSE](LICENSE).
