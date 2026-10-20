@@ -525,12 +525,17 @@ if [ -z "$aid" ] || [ "$aid" = "-1" ] || [ "$aid" = "null" ]; then
     exit 1
 fi
 
-# ── Colours (Terminal-neon HUD: one navy field, one magenta accent, dark console)
-c_accent=ffe94560     # hot magenta — used ONLY for the mark, divider, primary action
-c_bg=ff181a2f         # panel field
-c_console=ff0e1020    # darker output console
+# ── Colours ──────────────────────────────────────────────────────────────────
+# setBackgroundColor only sets backgroundTintList (termux-gui 0.1.6
+# HandleView.kt:482): it paints views that already HAVE a background drawable
+# (Buttons; an EditText's underline) and is a no-op on LinearLayout / ScrollView
+# / Space, which show the theme windowBackground the app puts on the root view.
+# So: tint buttons and input underlines, and draw lines as text — hairline().
+c_accent=ffe94560     # hot magenta — the mark and the primary action
+c_bg=ff181a2f         # panel field (no visible effect, see above)
+c_console=ff0e1020    # output console (no visible effect, see above)
 c_btn=ff242a44        # neutral button surface
-c_inputbg=ff10131f    # input well
+c_inputline=ff8a93b5  # input underline — must be light, it is the only outline
 c_text=ffe8e8f0       # primary text
 c_muted=ff8a93b5      # secondary text
 c_white=ffffffff
@@ -538,60 +543,98 @@ c_white=ffffffff
 # ── Build the UI ─────────────────────────────────────────────────────────────
 declare -A rp=(); root="$(tg_create_linear "$aid" rp)"
 
+# ── Sizing helper ────────────────────────────────────────────────────────────
+# fixed(): give a view an EXACT size. termux-gui creates every LinearLayout
+# child as LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, weight=1) plus
+# MATCH_PARENT on the cross axis (0.1.6 Util.kt:140), so a width alone still
+# stretches and weight 0 is mandatory. An exact height is what beats a Button's
+# theme 88x48dp minWidth/minHeight: a fixed LayoutParams measures the child with
+# an EXACTLY spec, and minimumHeight is ignored under EXACTLY.
+fixed() {   # $1 id  $2 width dp  $3 height dp
+    tg_view_width  "$aid" "$1" "$2"
+    tg_view_height "$aid" "$1" "$3"
+    tg_view_linear "$aid" "$1" 0
+}
+
 # Tiny bubble. It MUST be a Button: a Button consumes the touch so the overlay
 # delivers the full down/move/up gesture (a TextView only yields "down", which
 # breaks drag and tap-to-expand). Its click event is intentionally ignored —
 # expand/collapse and drag are driven entirely by overlayTouch in handle_touch.
 declare -A bubp=([$tgc_create_text]="⚡")
 bubble="$(tg_create_button "$aid" bubp "$root")"
-tg_view_width     "$aid" "$bubble" "$tgc_view_wrap_content"   # keep it tiny, not full-width
-tg_view_text_size "$aid" "$bubble" 13
-tg_view_padding   "$aid" "$bubble" 12 8 12 8
+fixed "$bubble" 48 44
+tg_view_text_size "$aid" "$bubble" 16
+tg_view_padding   "$aid" "$bubble" 0
 tg_view_bg_color  "$aid" "$bubble" "$c_accent"
 tg_view_text_color "$aid" "$bubble" "$c_white"
 
-# ── Panel sizing (FIXED pixels) ──────────────────────────────────────────────
-# Overlay windows are WRAP_CONTENT, so any MATCH_PARENT child expands the whole
-# window to full screen. Everything inside the panel is therefore sized with
-# fixed dp values (these are dp, NOT px — screen here is 480dpi / 448dp wide), and
-# the answer text gets a bounded width so it wraps instead of stretching the
-# window. Tweak PANEL_W / ANS_H to resize the box.
+# ── Panel sizing (every number is dp, not px) ────────────────────────────────
+# The overlay window is WRAP_CONTENT, so a MATCH_PARENT child would expand it to
+# full screen; everything inside gets fixed dp (screen here: 480dpi / 448dp
+# wide) and the answer text a bounded width so it wraps instead of stretching.
+# Vertical boxes (panel, setup_box, main_box) stay WRAP_CONTENT on purpose: a
+# fixed height there hands spare space to every weight=1 child inside them.
 PANEL_W=260
 PAD=8
 ROW_W=$((PANEL_W - 2*PAD))      # inner width that rows / buttons share
 ANS_W=$((ROW_W - 8))            # answer text width (so it wraps)
-ANS_H=200                       # answer area height
+ANS_H=180                       # console height
+
+# Row heights and margins. PANEL_H_DP below is derived from these so a layout
+# change cannot quietly leave it stale.
+BTN_H=36        # every Button; an exact height is the only thing that wins over
+                # the theme's 48dp minHeight
+TITLE_H=38      # header row height = max(TITLE_H, mkicon 34 + 2*ROW_M)
+IN_H=40         # input and Send
+HAIR_H=12       # divider line (hairline()); also clips its wrapped second line
+ROW_M=2         # margin on buttons / icons / console -> +2*ROW_M on that row
+HAIR_M=4        # margin around the divider
+
 DENSITY_DPI="$(/system/bin/getprop ro.sf.lcd_density 2>/dev/null)"
 case "$DENSITY_DPI" in ''|*[!0-9]*) DENSITY_DPI=480 ;; esac
 DENSITY_X=$((DENSITY_DPI / 160))     # dp -> px factor
 [ "$DENSITY_X" -lt 1 ] && DENSITY_X=1
-PANEL_H_DP=400                       # approximate expanded-panel height (dp)
+# CAVEAT: ro.sf.lcd_density (480 here) is not the density termux-gui converts dp
+# with when a display-density override is active — measured 2.44 px/dp (the 260dp
+# panel was 635px wide, i.e. 390dpi). So DENSITY_X can be ~20% too large, which
+# only ever errs safe: it over-covers the drag clamps and the title-band hit test.
+
+# Height the expanded panel occupies: padding + every row of main_box, the taller
+# of the two boxes. panel_place() clamps the window with this, so it must never be
+# less than the real height or the panel's bottom lands off-screen. Measured on
+# this device (screencap): the panel occupied 935px = 384dp, so the sum below
+# carries +8 for dp->px rounding.
+PANEL_H_DP=$(( 8 + 2*PAD + TITLE_H + HAIR_H + 2*HAIR_M \
+    + 2*(BTN_H + 2*ROW_M) + (IN_H + 2*ROW_M) + (ANS_H + 2*ROW_M) ))
 
 # Panel (hidden until expanded)
 declare -A pp=([$tgc_create_vertical]="true")
 panel="$(tg_create_linear "$aid" pp "$root")"
 tg_view_width    "$aid" "$panel" "$PANEL_W"
 tg_view_bg_color "$aid" "$panel" "$c_bg"
-tg_view_padding  "$aid" "$panel" "$PAD" "$PAD" "$PAD" "$PAD"
+tg_view_padding  "$aid" "$panel" "$PAD"
 tg_view_vis      "$aid" "$panel" "$tgc_vis_gone"
 
-mkbtn() {   # $1 parent  $2 text  [$3 textsize=11]  -> echoes id (styled, flat)
+mkbtn() {   # $1 parent  $2 text  [$3 textsize=12]  -> echoes id (styled, flat)
     declare -A _bp=([$tgc_create_text]="$2")
     local id; id="$(tg_create_button "$aid" _bp "$1")"
-    tg_view_text_size "$aid" "$id" "${3:-11}"
+    tg_view_text_size "$aid" "$id" "${3:-12}"
+    tg_view_height    "$aid" "$id" "$BTN_H"
+    tg_view_padding   "$aid" "$id" 2          # default ~16dp side padding wrapped short labels
     tg_view_bg_color  "$aid" "$id" "$c_btn"
     tg_view_text_color "$aid" "$id" "$c_text"
-    tg_view_margin    "$aid" "$id" 2
+    tg_view_margin    "$aid" "$id" "$ROW_M"
     echo "$id"
 }
-mkicon() {  # $1 parent  $2 glyph  -> small fixed-size flat icon button (accent glyph)
+mkicon() {  # $1 parent  $2 glyph  -> small fixed-size flat icon button
     declare -A _ip=([$tgc_create_text]="$2")
     local id; id="$(tg_create_button "$aid" _ip "$1")"
-    tg_view_width     "$aid" "$id" 38
-    tg_view_text_size "$aid" "$id" 15
-    tg_view_bg_color  "$aid" "$id" "$c_bg"      # blends into the header
+    fixed "$id" 34 34          # weight 0: must not share spare width with the title
+    tg_view_padding   "$aid" "$id" 0
+    tg_view_text_size "$aid" "$id" 14
+    tg_view_bg_color  "$aid" "$id" "$c_btn"
     tg_view_text_color "$aid" "$id" "$c_muted"
-    tg_view_margin    "$aid" "$id" 1
+    tg_view_margin    "$aid" "$id" "$ROW_M"
     echo "$id"
 }
 hrow() {   # $1 parent -> echoes a fixed-width horizontal linear id
@@ -600,13 +643,18 @@ hrow() {   # $1 parent -> echoes a fixed-width horizontal linear id
     tg_view_width "$aid" "$id" "$ROW_W"
     echo "$id"
 }
-hairline() {   # a 1dp accent divider spanning the row
-    declare -A _dp=()
-    local id; id="$(tg_create_space "$aid" _dp "$1")"
-    tg_view_width  "$aid" "$id" "$ROW_W"
-    tg_view_height "$aid" "$id" 1
-    tg_view_bg_color "$aid" "$id" "$c_accent"
-    tg_view_margin "$aid" "$id" 4
+hairline() {   # accent divider spanning the row. A Space has no background
+               # drawable, so tg_view_bg_color on one tints nothing (that divider
+               # was invisible); this is a TextView of box glyphs instead, with
+               # more glyphs than fit so the line always spans the row and the
+               # wrapped remainder gets clipped by the exact height.
+    declare -A _dp=([$tgc_create_text]="────────────────────────────────────────────────────────────────────────────────")
+    local id; id="$(tg_create_text "$aid" _dp "$1")"
+    fixed "$id" "$ROW_W" "$HAIR_H"
+    tg_view_padding    "$aid" "$id" 0
+    tg_view_text_size  "$aid" "$id" 8
+    tg_view_text_color "$aid" "$id" "$c_accent"
+    tg_view_margin     "$aid" "$id" "$HAIR_M"
 }
 weigh() {  # give a view equal layout-weight so a row's buttons fill the width
     tg_view_width "$aid" "$1" 0
@@ -624,6 +672,7 @@ declare -A skp=([$tgc_create_text]="" [$tgc_create_type]="textPassword" [$tgc_cr
 setup_input="$(tg_create_edit "$aid" skp "$setup_box")"
 tg_view_width "$aid" "$setup_input" "$ROW_W"
 tg_view_text_color "$aid" "$setup_input" "$c_text"
+tg_view_bg_color   "$aid" "$setup_input" "$c_inputline"   # visible underline
 setup_row="$(hrow "$setup_box")"
 setup_paste="$(mkbtn "$setup_row" "Paste")"; weigh "$setup_paste"
 setup_save="$(mkbtn "$setup_row" "Save key")"; weigh "$setup_save"
@@ -635,12 +684,14 @@ tg_view_width "$aid" "$main_box" "$ROW_W"
 
 # header row: accent mark + title (left), small icon buttons (right)
 title_row="$(hrow "$main_box")"
-declare -A tlp=([$tgc_create_text]="⚡ DEEPSEEK")
+declare -A tlp=([$tgc_create_text]="⚡ DeepSeek")
 title="$(tg_create_text "$aid" tlp "$title_row")"
 tg_view_text_color "$aid" "$title" "$c_accent"
 tg_view_text_size  "$aid" "$title" 15
 tg_view_gravity    "$aid" "$title" "$tgc_grav_top_left" "$tgc_grav_center"
 tg_view_width "$aid" "$title" 0; tg_view_linear "$aid" "$title" 1
+tg_view_height "$aid" "$title" "$TITLE_H"      # = the icon row height, so text centres
+tg_view_padding "$aid" "$title" 4 "$tgc_dir_left"
 close_btn="$(mkicon "$title_row" "▽")"
 quit_btn="$(mkicon  "$title_row" "✕")"
 model_btn="$(mkicon "$title_row" "M")"
@@ -648,23 +699,25 @@ hairline "$main_box"
 
 # clipboard action toolbar (acts on the currently-copied text) — smaller text fits
 act_row="$(hrow "$main_box")"
-act_tr="$(mkbtn "$act_row" "Trans" 10)";  weigh "$act_tr"
-act_sum="$(mkbtn "$act_row" "Sum" 10)";   weigh "$act_sum"
-act_exp="$(mkbtn "$act_row" "Expl" 10)";  weigh "$act_exp"
-act_fix="$(mkbtn "$act_row" "Fix" 10)";   weigh "$act_fix"
-act_reply="$(mkbtn "$act_row" "Reply" 10)"; weigh "$act_reply"
+act_tr="$(mkbtn "$act_row" "Trans" 11)";  weigh "$act_tr"
+act_sum="$(mkbtn "$act_row" "Sum" 11)";   weigh "$act_sum"
+act_exp="$(mkbtn "$act_row" "Expl" 11)";  weigh "$act_exp"
+act_fix="$(mkbtn "$act_row" "Fix" 11)";   weigh "$act_fix"
+act_reply="$(mkbtn "$act_row" "Reply" 11)"; weigh "$act_reply"
 
 # input row: a visible input well + a compact accent Send
 in_row="$(hrow "$main_box")"
 declare -A inp=([$tgc_create_text]="" [$tgc_create_single_line]="true")
 input="$(tg_create_edit "$aid" inp "$in_row")"
 tg_view_width "$aid" "$input" 0; tg_view_linear "$aid" "$input" 1
-tg_view_bg_color   "$aid" "$input" "$c_inputbg"
+tg_view_height     "$aid" "$input" "$IN_H"
+tg_view_bg_color   "$aid" "$input" "$c_inputline"   # tints the underline
 tg_view_text_color "$aid" "$input" "$c_text"
-tg_view_padding    "$aid" "$input" 10 8 10 8
-tg_view_margin     "$aid" "$input" 2
-send_btn="$(mkbtn "$in_row" "Send" 12)"
-tg_view_width "$aid" "$send_btn" 76
+tg_view_text_size  "$aid" "$input" 14
+tg_view_padding    "$aid" "$input" 8
+tg_view_margin     "$aid" "$input" "$ROW_M"
+send_btn="$(mkbtn "$in_row" "Send" 13)"
+fixed "$send_btn" 64 "$IN_H"   # weight 0, or it eats the input's width
 tg_view_bg_color "$aid" "$send_btn" "$c_accent"
 tg_view_text_color "$aid" "$send_btn" "$c_white"
 
@@ -673,27 +726,25 @@ ctl_row="$(hrow "$main_box")"
 copy_btn="$(mkbtn  "$ctl_row" "Copy")";  weigh "$copy_btn"
 speak_btn="$(mkbtn "$ctl_row" "Speak")"; weigh "$speak_btn"
 reset_btn="$(mkbtn "$ctl_row" "Reset")"; weigh "$reset_btn"
-
 mic_btn="$(mkbtn "$ctl_row" "Mic")";   weigh "$mic_btn"
+
 # answer console (scrollable) — distinct dark surface, last
 declare -A scp=()
 scroll="$(tg_create_nested_scroll "$aid" scp "$main_box")"
 tg_view_width   "$aid" "$scroll" "$ROW_W"
 tg_view_height  "$aid" "$scroll" "$ANS_H"
 tg_view_bg_color "$aid" "$scroll" "$c_console"
-tg_view_margin  "$aid" "$scroll" 2
+tg_view_margin  "$aid" "$scroll" "$ROW_M"
 declare -A anp=([$tgc_create_text]="› Copy text + tap an action, or type a request. I can run commands on your device." [$tgc_create_selectable_text]="true")
 answer="$(tg_create_text "$aid" anp "$scroll")"
 tg_view_width "$aid" "$answer" "$ANS_W"     # bounded so the text wraps
 tg_view_text_size  "$aid" "$answer" 13
-tg_view_padding    "$aid" "$answer" 10 8 10 8
+tg_view_padding    "$aid" "$answer" 8
 tg_view_text_color "$aid" "$answer" "$c_text"
 
 # ── Transcript management ────────────────────────────────────────────────────
 TRANSCRIPT="› Copy text + tap an action, or type a request. I can run commands on your device."
 LAST_ANSWER=""
-[ "$RESTORED_MSGS" -gt 1 ] && transcript_set "› Restored $((RESTORED_MSGS-1)) messages from the last session.
-$TRANSCRIPT"
 # tg_str_quote can only escape \n and \t — any other control byte (a stray \r,
 # ANSI escapes, or a literal RS, which is the protocol delimiter!) would produce
 # a broken setText message. Strip them before anything reaches the screen.
@@ -712,6 +763,9 @@ transcript_add() {
     tg_view_text "$aid" "$answer" "$TRANSCRIPT"
     scroll_bottom
 }
+
+[ "$RESTORED_MSGS" -gt 1 ] && transcript_set "› Restored $((RESTORED_MSGS-1)) messages from the last session.
+$TRANSCRIPT"
 
 # ── Setup / main toggling ────────────────────────────────────────────────────
 show_setup() {
