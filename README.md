@@ -73,7 +73,7 @@ Everything lives in `~/.config/deepseek-bubble/config` (created on first save, `
 | `DEEPSEEK_MODEL` | `deepseek-flash` | model id; `deepseek-v4-pro` is the bigger one |
 | `DEEPSEEK_API_URL` | `https://api.deepseek.com/chat/completions` | any OpenAI-compatible endpoint |
 | `DEEPSEEK_MAX_TOKENS` | `8000` | output cap per reply |
-| `DEEPSEEK_THINKING` | `off` | `off` (fast), `on`, or `default` (server decides) |
+| `DEEPSEEK_THINKING` | `off` | `off` (fast, no reasoning pass), `on`, or `default` (server decides; for `deepseek-flash` that currently means **on**, so only `off` changes anything) |
 | `BASH_CONFIRM` | `0` | `1` = risky commands wait for a **Run** tap |
 
 Only `DEEPSEEK_API_KEY` is required. Every command the model runs is appended to

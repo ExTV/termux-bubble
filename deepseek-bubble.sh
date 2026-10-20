@@ -272,30 +272,45 @@ api_stream_post() {   # $1 = body
     STREAM_MSG=""; API_RESP=""; CURL_ERR=""; HTTP_CODE=""
     POST_T0=$SECONDS; POST_LASTT=-1
     printf '%s' "$1" >"$bodyf"
-    stream_reset
-    curl -sS -N --max-time 240 "$API_URL" \
-        -H "Authorization: Bearer $API_KEY" \
-        -H "Content-Type: application/json" \
-        --data-binary @"$bodyf" -o "$STREAM_FILE" -w '%{http_code}' >"$codef" 2>"$errf" &
-    pid=$!
-    while kill -0 "$pid" 2>/dev/null; do
-        busy_pump
-        if [ "$CANCEL" = 1 ]; then
-            kill "$pid" 2>/dev/null
-            wait "$pid" 2>/dev/null
-            return 2
-        fi
-        stream_pump 1
-        if [ $((SECONDS - POST_T0)) -ne "$POST_LASTT" ]; then
-            POST_LASTT=$((SECONDS - POST_T0))
-            [ -z "$STREAM_TEXT" ] && tg_view_text "$aid" "$send_btn" "Stop ${POST_LASTT}s"
-        fi
-        sleep 0.15
+    local attempt=0
+    while :; do
+        stream_reset
+        curl -sS -N --max-time 240 "$API_URL" \
+            -H "Authorization: Bearer $API_KEY" \
+            -H "Content-Type: application/json" \
+            --data-binary @"$bodyf" -o "$STREAM_FILE" -w '%{http_code}' >"$codef" 2>"$errf" &
+        pid=$!
+        while kill -0 "$pid" 2>/dev/null; do
+            busy_pump
+            if [ "$CANCEL" = 1 ]; then
+                kill "$pid" 2>/dev/null
+                wait "$pid" 2>/dev/null
+                return 2
+            fi
+            stream_pump 1
+            if [ $((SECONDS - POST_T0)) -ne "$POST_LASTT" ]; then
+                POST_LASTT=$((SECONDS - POST_T0))
+                [ -z "$STREAM_TEXT" ] && tg_view_text "$aid" "$send_btn" "Stop ${POST_LASTT}s"
+            fi
+            sleep 0.15
+        done
+        wait "$pid" 2>/dev/null; ec=$?
+        stream_pump 0                       # drain what is left
+        HTTP_CODE="$(cat "$codef" 2>/dev/null)"
+        CURL_ERR="$(head -c 200 "$errf" 2>/dev/null | tr -d '\n')"
+        # same policy as api_post: transient server-side failures get another
+        # try (nothing was rendered yet, those replies are a JSON error, not SSE)
+        case "$HTTP_CODE" in
+            429|500|502|503|504)
+                if [ "$attempt" -lt "$HTTP_RETRIES" ]; then
+                    attempt=$((attempt+1))
+                    toast "Retrying (HTTP $HTTP_CODE)…"
+                    sleep "$attempt"
+                    continue
+                fi ;;
+        esac
+        break
     done
-    wait "$pid" 2>/dev/null; ec=$?
-    stream_pump 0                       # drain what is left
-    HTTP_CODE="$(cat "$codef" 2>/dev/null)"
-    CURL_ERR="$(head -c 200 "$errf" 2>/dev/null | tr -d '\n')"
     if [ "$ec" -ne 0 ]; then
         [ -z "$CURL_ERR" ] && CURL_ERR="curl exit $ec"
         return 1
