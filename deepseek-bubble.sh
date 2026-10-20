@@ -16,8 +16,14 @@ set -u
 # ── Configuration ────────────────────────────────────────────────────────────
 CONFIG_DIR="$HOME/.config/deepseek-bubble"
 CONFIG_FILE="$CONFIG_DIR/config"
-API_URL="https://api.deepseek.com/chat/completions"
-DEFAULT_MODEL="deepseek-chat"   # stable documented alias; override with DEEPSEEK_MODEL in the config file
+DEFAULT_API_URL="https://api.deepseek.com/chat/completions"
+DEFAULT_MODEL="deepseek-flash"   # current DeepSeek id; deepseek-v4-pro is the bigger one
+DEFAULT_MAX_TOKENS=8000
+DEFAULT_THINKING="off"           # off = fastest answers; on = reasoning pass; default = let the server decide
+DEFAULT_CONFIRM_DANGEROUS=0      # 1 = ask before risky shell commands
+MAX_RUN_SECONDS=300              # wall-clock cap for one agent run (all iterations)
+HTTP_RETRIES=2                   # retries for 429 / 5xx
+RISKY_PATTERN='(^|[;&|(]|&&|\|\|)[[:space:]]*(rm|rmdir|shred|mkfs|dd|truncate|mv|chmod|chown|pm[[:space:]]+(un)?install|am[[:space:]]+force-stop|settings[[:space:]]+put|reboot|svc[[:space:]]|cmd[[:space:]]|termux-clipboard-set)'
 MAX_ITERS=25            # agent tool-call loop cap
 CMD_TIMEOUT=120         # per run_bash timeout (seconds)
 OUT_LIMIT=10000         # max chars of tool output fed back to the model
@@ -46,19 +52,27 @@ TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/deepseek-bubble.XXXXXX")" || exit 1
 # behaviour and add our temp cleanup on top.
 trap 'rm -rf "$TMP_DIR" >/dev/null 2>&1; set +u; kill -9 $tg__main_PID >/dev/null 2>&1; kill -9 $tg__event_PID >/dev/null 2>&1' EXIT
 
-# ── Secrets / config storage ─────────────────────────────────────────────────
+API_URL="$DEFAULT_API_URL"
 DEEPSEEK_MODEL="$DEFAULT_MODEL"
+MAX_TOKENS="$DEFAULT_MAX_TOKENS"
+THINKING="$DEFAULT_THINKING"
+CONFIRM_DANGEROUS="$DEFAULT_CONFIRM_DANGEROUS"
 API_KEY="${DEEPSEEK_API_KEY:-}"
+HIST_FILE="$CONFIG_DIR/history.json"
+CMD_LOG="$CONFIG_DIR/cmd.log"
 
 load_config() {
-    [ -n "$API_KEY" ] && return            # env var wins
     [ -f "$CONFIG_FILE" ] || return
     # split on the FIRST '=' only, keeping any '=' inside the value
     local line v
     while IFS= read -r line || [ -n "$line" ]; do
         case "$line" in
-            DEEPSEEK_API_KEY=*) v="${line#*=}"; [ -n "$v" ] && API_KEY="$v" ;;
-            DEEPSEEK_MODEL=*)   v="${line#*=}"; [ -n "$v" ] && DEEPSEEK_MODEL="$v" ;;
+            DEEPSEEK_API_KEY=*)  v="${line#*=}"; [ -z "${DEEPSEEK_API_KEY:-}" ] && [ -n "$v" ] && API_KEY="$v" ;;
+            DEEPSEEK_MODEL=*)    v="${line#*=}"; [ -n "$v" ] && DEEPSEEK_MODEL="$v" ;;
+            DEEPSEEK_API_URL=*)  v="${line#*=}"; [ -n "$v" ] && API_URL="$v" ;;
+            DEEPSEEK_MAX_TOKENS=*) v="${line#*=}"; [ -n "$v" ] && MAX_TOKENS="$v" ;;
+            DEEPSEEK_THINKING=*) v="${line#*=}"; [ -n "$v" ] && THINKING="$v" ;;
+            BASH_CONFIRM=*)      v="${line#*=}"; [ -n "$v" ] && CONFIRM_DANGEROUS="$v" ;;
         esac
     done < "$CONFIG_FILE"
 }
@@ -66,11 +80,13 @@ load_config() {
 save_config() {
     mkdir -p "$CONFIG_DIR"
     chmod 700 "$CONFIG_DIR" 2>/dev/null
-    ( umask 077; printf 'DEEPSEEK_API_KEY=%s\nDEEPSEEK_MODEL=%s\n' "$API_KEY" "$DEEPSEEK_MODEL" > "$CONFIG_FILE" )
+    ( umask 077; printf 'DEEPSEEK_API_KEY=%s\nDEEPSEEK_MODEL=%s\nDEEPSEEK_API_URL=%s\nDEEPSEEK_MAX_TOKENS=%s\nDEEPSEEK_THINKING=%s\nBASH_CONFIRM=%s\n' \
+        "$API_KEY" "$DEEPSEEK_MODEL" "$API_URL" "$MAX_TOKENS" "$THINKING" "$CONFIRM_DANGEROUS" > "$CONFIG_FILE" )
     chmod 600 "$CONFIG_FILE" 2>/dev/null
 }
 
 load_config
+case "$MAX_TOKENS" in ''|*[!0-9]*) MAX_TOKENS="$DEFAULT_MAX_TOKENS" ;; esac
 
 # ── Small helpers ────────────────────────────────────────────────────────────
 toast() { termux-toast -g top "$1" >/dev/null 2>&1 & }
@@ -91,45 +107,176 @@ get_text() {
 # Send turns into a Stop button that cancels the current run.
 CANCEL=0
 
+BUSY=0; PENDING=0; APPROVE=0
 busy_pump() {   # handle any queued UI events while an API call / command runs
-    local ev etype id
-    while IFS= read -t 0 -r -s -u "${tg__event[0]}"; do
-        ev="$(tg_msg_recv_event_blocking)" || exit 0
-        etype="$(tg_event_type "$ev")"
-        case "$etype" in
-            destroy) exit 0 ;;
-            config)  update_screen_bounds ;;
-            overlayTouch) handle_touch "$ev" ;;
-            click)
-                id="$(tg_event_id "$ev")"
-                case "$id" in
-                    "$quit_btn")  tg_activity_finish "$aid"; exit 0 ;;
-                    "$close_btn") collapse ;;
-                    "$send_btn"|"$reset_btn") CANCEL=1; toast "Stopping…" ;;
-                    "$copy_btn")  [ -n "$LAST_ANSWER" ] && { printf '%s' "$LAST_ANSWER" | termux-clipboard-set 2>/dev/null; toast "Copied"; } ;;
-                    "$speak_btn") [ -n "$LAST_ANSWER" ] && termux-tts-speak "$LAST_ANSWER" >/dev/null 2>&1 & ;;
-                esac
-                ;;
-        esac
+    local n=0
+    while [ "$n" -lt 60 ] && ev_ready; do
+        n=$((n+1))
+        recv_ev || break
+        handle_event "$EV"
     done
 }
 
-busy_begin() { CANCEL=0; tg_view_text "$aid" "$send_btn" "Stop"; }
-busy_end()   { CANCEL=0; tg_view_text "$aid" "$send_btn" "Send"; }
+busy_begin() { BUSY=1; CANCEL=0; tg_view_text "$aid" "$send_btn" "Stop"; }
+busy_end()   { BUSY=0; CANCEL=0; tg_view_text "$aid" "$send_btn" "Send"; }
 
 # ── DeepSeek API ─────────────────────────────────────────────────────────────
 API_RESP=""
 CURL_ERR=""
-api_post() {   # $1 = JSON body -> sets API_RESP; returns 0=ok 1=error 2=cancelled
-    API_RESP=""; CURL_ERR=""
-    local bodyf="$TMP_DIR/body.json" respf="$TMP_DIR/resp.json" errf="$TMP_DIR/curl.err" pid ec
+HTTP_CODE=""
+api_post() {   # $1 = JSON body -> sets API_RESP, HTTP_CODE; returns 0=ok 1=error 2=cancelled
+    API_RESP=""; CURL_ERR=""; HTTP_CODE=""
+    local attempt=0 bodyf="$TMP_DIR/body.json" respf="$TMP_DIR/resp.json" \
+          errf="$TMP_DIR/curl.err" codef="$TMP_DIR/curl.code" pid ec
+    POST_T0=$SECONDS; POST_LASTT=-1
     # body via file: request bodies can exceed the kernel's 128KiB per-argument limit
     printf '%s' "$1" >"$bodyf"
-    : >"$respf"; : >"$errf"
-    curl -sS --max-time 240 "$API_URL" \
+    while :; do
+        : >"$respf"; : >"$errf"; : >"$codef"
+        curl -sS --max-time 240 "$API_URL" \
+            -H "Authorization: Bearer $API_KEY" \
+            -H "Content-Type: application/json" \
+            --data-binary @"$bodyf" -o "$respf" -w '%{http_code}' >"$codef" 2>"$errf" &
+        pid=$!
+        while kill -0 "$pid" 2>/dev/null; do
+            busy_pump
+            # elapsed-time feedback while the request is in flight
+            if [ $((SECONDS - POST_T0)) -ne "$POST_LASTT" ]; then
+                POST_LASTT=$((SECONDS - POST_T0))
+                tg_view_text "$aid" "$send_btn" "Stop ${POST_LASTT}s"
+            fi
+            if [ "$CANCEL" = 1 ]; then
+                kill "$pid" 2>/dev/null
+                wait "$pid" 2>/dev/null
+                return 2
+            fi
+            sleep 0.2
+        done
+        wait "$pid" 2>/dev/null; ec=$?
+        HTTP_CODE="$(cat "$codef" 2>/dev/null)"
+        API_RESP="$(cat "$respf" 2>/dev/null)"
+        CURL_ERR="$(head -c 200 "$errf" 2>/dev/null | tr -d '\n')"
+        # transient server-side failures are worth another try; 4xx never is
+        case "$HTTP_CODE" in
+            429|500|502|503|504)
+                if [ "$attempt" -lt "$HTTP_RETRIES" ]; then
+                    attempt=$((attempt+1))
+                    toast "Retrying (HTTP $HTTP_CODE)…"
+                    sleep "$attempt"
+                    continue
+                fi ;;
+        esac
+        break
+    done
+    if [ "$ec" -ne 0 ]; then
+        [ -z "$CURL_ERR" ] && CURL_ERR="curl exit $ec"
+        return 1
+    fi
+    if [ -n "$HTTP_CODE" ] && [ "$HTTP_CODE" -ge 400 ] 2>/dev/null; then
+        CURL_ERR="HTTP $HTTP_CODE$( jq -r 'if .error.message then ": " + .error.message else "" end' <<<"$API_RESP" 2>/dev/null)"
+        return 1
+    fi
+    return 0
+}
+
+# Build the request body from a messages array on stdin. One place for model,
+# token cap and thinking mode so the one-shot and agent paths stay in sync.
+json_body() {   # $1 = "tools" to send the tool schema, $2 = "stream" to stream
+    jq -c --arg m "$DEEPSEEK_MODEL" --argjson mt "${MAX_TOKENS:-8000}" \
+          --arg th "$THINKING" --argjson tools "$TOOLS" --arg mode "${1:-notools}" \
+          --arg stream "${2:-off}" '
+        {model:$m, messages:., max_tokens:$mt}
+        + (if $th == "off" then {thinking:{type:"disabled"}}
+           elif $th == "on" then {thinking:{type:"enabled"}}
+           else {} end)
+        + (if $mode == "tools" then {tools:$tools, tool_choice:"auto"} else {} end)
+        + (if $stream == "stream" then {stream:true} else {} end)'
+}
+
+# ── Streaming (SSE) ─────────────────────────────────────────────────────────
+# BEGIN STREAM BLOCK — kept contiguous so the parser can be unit-tested on its own
+STREAM_FILE=""
+STREAM_STATE=""
+STREAM_TEXT=""
+STREAM_LINES=0
+STREAM_TOOLS=0
+
+stream_reset() {
+    STREAM_FILE="$TMP_DIR/resp.stream"
+    STREAM_STATE="$TMP_DIR/stream.state"
+    : >"$STREAM_FILE"
+    printf '%s\n' '{"content":"","tools":{},"finish":null}' >"$STREAM_STATE"
+    STREAM_TEXT=""; STREAM_LINES=0; STREAM_TOOLS=0
+}
+
+# merge a batch of `choices[0].delta` objects (JSON array on stdin) into the state
+stream_merge() {
+    local tmp="$TMP_DIR/stream.merge"
+    jq -c --slurpfile st "$STREAM_STATE" '
+      ($st[0]) as $s
+      | reduce .[] as $d ($s;
+          .finish = ($d.finish_reason // .finish)
+          | .content += (($d.content // ""))
+          | reduce (($d.tool_calls // [])[]) as $tc (.;
+              ($tc.index | tostring) as $i
+              | .tools[$i] = ((.tools[$i] // {"id":null,"name":null,"arguments":""})
+                  | (if ($tc.id // null) != null then .id = $tc.id else . end)
+                  | (if ($tc.function.name // null) != null then .name = $tc.function.name else . end)
+                  | .arguments += (($tc.function.arguments) // "")) ))
+    ' >"$tmp" 2>/dev/null && mv "$tmp" "$STREAM_STATE"
+    STREAM_TEXT="$(jq -r '.content // ""' "$STREAM_STATE" 2>/dev/null)"
+    STREAM_TOOLS="$(jq -r '.tools | length' "$STREAM_STATE" 2>/dev/null)"
+    [ -z "$STREAM_TOOLS" ] && STREAM_TOOLS=0
+}
+
+# consume every complete SSE line that arrived since the last call
+stream_pump() {   # $1 = 1 to render the accumulated text
+    local total
+    [ -s "$STREAM_FILE" ] || return 0
+    total="$(wc -l <"$STREAM_FILE" 2>/dev/null)"
+    [ "${total:-0}" -gt "$STREAM_LINES" ] || return 0
+    sed -n "$((STREAM_LINES+1)),${total}p" "$STREAM_FILE" 2>/dev/null \
+        | sed -n 's/^data: *//p' \
+        | grep -v '^\[DONE\]' \
+        | jq -sc '[.[] | (.choices[0].delta // empty)]' 2>/dev/null >"$TMP_DIR/stream.deltas"
+    STREAM_LINES=$total
+    [ -s "$TMP_DIR/stream.deltas" ] && stream_merge <"$TMP_DIR/stream.deltas"
+    if [ "${1:-0}" = 1 ] && [ -n "$STREAM_TEXT" ]; then
+        tg_view_text "$aid" "$answer" "$TRANSCRIPT_PRE$STREAM_TEXT"
+        scroll_bottom
+    fi
+    return 0
+}
+
+# the assembled assistant message, ready to append to HISTORY
+stream_finalize() {
+    jq -c '
+      {role:"assistant"}
+      + (if (.content | length) > 0 then {content:.content} else {} end)
+      + (if (.tools | length) > 0 then
+           {tool_calls: [ .tools | to_entries[] | .value
+              | {id:(.id // ""), type:"function",
+                 function:{name:(.name // ""), arguments:(.arguments // "")}} ]}
+         else {} end)
+    ' "$STREAM_STATE" 2>/dev/null
+}
+
+# true when the response looks like SSE rather than a plain JSON object
+stream_is_sse() { grep -q '^data: ' "$STREAM_FILE" 2>/dev/null; }
+
+# POST with streaming: streams the reply into the answer view, then leaves the
+# assembled message in STREAM_MSG. Returns 0=ok 1=error 2=cancelled.
+STREAM_MSG=""
+api_stream_post() {   # $1 = body
+    local bodyf="$TMP_DIR/sbody.json" codef="$TMP_DIR/scode" errf="$TMP_DIR/serr" pid ec
+    STREAM_MSG=""; API_RESP=""; CURL_ERR=""; HTTP_CODE=""
+    POST_T0=$SECONDS; POST_LASTT=-1
+    printf '%s' "$1" >"$bodyf"
+    stream_reset
+    curl -sS -N --max-time 240 "$API_URL" \
         -H "Authorization: Bearer $API_KEY" \
         -H "Content-Type: application/json" \
-        --data-binary @"$bodyf" -o "$respf" 2>"$errf" &
+        --data-binary @"$bodyf" -o "$STREAM_FILE" -w '%{http_code}' >"$codef" 2>"$errf" &
     pid=$!
     while kill -0 "$pid" 2>/dev/null; do
         busy_pump
@@ -138,14 +285,34 @@ api_post() {   # $1 = JSON body -> sets API_RESP; returns 0=ok 1=error 2=cancell
             wait "$pid" 2>/dev/null
             return 2
         fi
-        sleep 0.2
+        stream_pump 1
+        if [ $((SECONDS - POST_T0)) -ne "$POST_LASTT" ]; then
+            POST_LASTT=$((SECONDS - POST_T0))
+            [ -z "$STREAM_TEXT" ] && tg_view_text "$aid" "$send_btn" "Stop ${POST_LASTT}s"
+        fi
+        sleep 0.15
     done
     wait "$pid" 2>/dev/null; ec=$?
-    API_RESP="$(cat "$respf" 2>/dev/null)"
+    stream_pump 0                       # drain what is left
+    HTTP_CODE="$(cat "$codef" 2>/dev/null)"
     CURL_ERR="$(head -c 200 "$errf" 2>/dev/null | tr -d '\n')"
-    [ "$ec" -ne 0 ] && return 1
+    if [ "$ec" -ne 0 ]; then
+        [ -z "$CURL_ERR" ] && CURL_ERR="curl exit $ec"
+        return 1
+    fi
+    if [ -n "$HTTP_CODE" ] && [ "$HTTP_CODE" -ge 400 ] 2>/dev/null; then
+        CURL_ERR="HTTP $HTTP_CODE$( jq -r 'if .error.message then ": " + .error.message else "" end' <"$STREAM_FILE" 2>/dev/null)"
+        return 1
+    fi
+    if ! stream_is_sse; then
+        # the endpoint ignored stream:true — fall back to the plain object
+        API_RESP="$(cat "$STREAM_FILE" 2>/dev/null)"
+        return 0
+    fi
+    STREAM_MSG="$(stream_finalize)"
     return 0
 }
+# END STREAM BLOCK
 
 # one-shot, no tools, no history — used by the clipboard quick-actions.
 # Must be called in the main shell; the answer lands in ONESHOT_ANSWER.
@@ -153,12 +320,20 @@ ONESHOT_ANSWER=""
 ds_oneshot() {   # $1 = prompt -> sets ONESHOT_ANSWER
     ONESHOT_ANSWER=""
     local body rc
+    TRANSCRIPT_PRE="$TRANSCRIPT"
     # prompt via stdin: clipboard text can be arbitrarily large
-    body="$(printf '%s' "$1" | jq -Rsc --arg m "$DEEPSEEK_MODEL" \
-        '{model:$m, messages:[{role:"user",content:.}]}')"
-    api_post "$body"; rc=$?
+    body="$(printf '%s' "$1" | jq -Rsc '[{role:"user",content:.}]' | json_body notools stream)"
+    api_stream_post "$body"; rc=$?
     if [ "$rc" = 2 ]; then ONESHOT_ANSWER="(stopped)"; return 1; fi
-    if [ "$rc" != 0 ] || [ -z "$API_RESP" ]; then
+    if [ "$rc" != 0 ]; then
+        ONESHOT_ANSWER="Network error: ${CURL_ERR:-no response}"; return 1
+    fi
+    if stream_is_sse; then
+        ONESHOT_ANSWER="$STREAM_TEXT"
+        [ -z "$ONESHOT_ANSWER" ] && ONESHOT_ANSWER="No response."
+        return 0
+    fi
+    if [ -z "$API_RESP" ]; then
         ONESHOT_ANSWER="Network error: ${CURL_ERR:-no response}"; return 1
     fi
     ONESHOT_ANSWER="$(jq -r '.choices[0].message.content // .error.message // "No response."' <<<"$API_RESP" 2>/dev/null)" \
@@ -177,15 +352,36 @@ trim_history() {   # $1 = char budget
     done
 }
 
+# ── Conversation persistence ─────────────────────────────────────────────────
+# The history survives a restart; Reset clears it. Kept private (0600) because
+# it contains everything the user asked and everything the model ran.
+hist_save() {
+    [ -n "${HISTORY:-}" ] || return 0
+    mkdir -p "$CONFIG_DIR" 2>/dev/null
+    ( umask 077; printf '%s' "$HISTORY" >"$HIST_FILE" ) 2>/dev/null
+}
+hist_clear() {
+    HISTORY='[]'
+    rm -f "$HIST_FILE" 2>/dev/null
+}
+hist_load() {
+    [ -s "$HIST_FILE" ] || return 0
+    local h; h="$(cat "$HIST_FILE" 2>/dev/null)"
+    jq -e 'type == "array" and length > 1' >/dev/null 2>&1 <<<"$h" || return 0
+    HISTORY="$h"
+    RESTORED_MSGS="$(jq 'length' <<<"$h")"
+}
+
 # agentic, multi-turn, with run_bash. Uses + updates the global HISTORY, and
 # returns the final answer in the global AGENT_ANSWER. It must be called in the
 # main shell (NOT via $(...)), otherwise HISTORY updates are lost to the subshell
 # and conversation memory breaks.
 HISTORY='[]'
+RESTORED_MSGS=0; hist_load
 AGENT_ANSWER=""
 ds_agent() {   # $1 = user input -> sets AGENT_ANSWER
     AGENT_ANSWER=""
-    local user="$1"
+    local user="$1" run_start=$SECONDS
     if [ "$HISTORY" = '[]' ]; then
         HISTORY="$(jq -nc --arg s "$SYSTEM_PROMPT" '[{role:"system",content:$s}]')"
     fi
@@ -194,36 +390,57 @@ ds_agent() {   # $1 = user input -> sets AGENT_ANSWER
 
     local i body resp err fr msg n j callid cargs cmd out toolmsg rc
     for ((i=0; i<MAX_ITERS; i++)); do
+        if [ $((SECONDS - run_start)) -gt "$MAX_RUN_SECONDS" ]; then
+            AGENT_ANSWER="(stopped: run budget of ${MAX_RUN_SECONDS}s exhausted)"
+            hist_save
+            return 1
+        fi
         trim_history "$HIST_HARD_LIMIT"
         # history via stdin, not --argjson: it can exceed the per-argument limit
-        body="$(jq -c --arg m "$DEEPSEEK_MODEL" --argjson tools "$TOOLS" \
-            '{model:$m, messages:., tools:$tools, tool_choice:"auto"}' <<<"$HISTORY")"
-        api_post "$body"; rc=$?
-        [ "$rc" = 2 ] && { AGENT_ANSWER="(stopped)"; return 1; }
-        resp="$API_RESP"
-        if [ "$rc" != 0 ] || [ -z "$resp" ]; then
-            AGENT_ANSWER="Network error: ${CURL_ERR:-no response}"; return 1
+        body="$(json_body tools stream <<<"$HISTORY")"
+        TRANSCRIPT_PRE="$TRANSCRIPT"      # live text renders on top of this
+        api_stream_post "$body"; rc=$?
+        [ "$rc" = 2 ] && { AGENT_ANSWER="(stopped)"; hist_save; return 1; }
+        if [ "$rc" != 0 ]; then
+            AGENT_ANSWER="Network error: ${CURL_ERR:-no response}"; hist_save; return 1
         fi
-        jq -e . >/dev/null 2>&1 <<<"$resp" || { AGENT_ANSWER="Unexpected API response."; return 1; }
-        err="$(jq -r '.error.message // empty' <<<"$resp")"
-        [ -n "$err" ] && { AGENT_ANSWER="API error: $err"; return 1; }
-
-        fr="$(jq -r '.choices[0].finish_reason // "stop"' <<<"$resp")"
-        # append assistant message (strip reasoning_content; keep content+tool_calls;
-        # never emit a message with neither — the API rejects it next turn)
-        msg="$(jq -c '.choices[0].message
-                | {role:"assistant", content:(.content // null), tool_calls:(.tool_calls // null)}
-                | with_entries(select(.value != null))
-                | if (has("content") or has("tool_calls")) then . else . + {content:""} end' <<<"$resp")"
+        if stream_is_sse; then
+            msg="$STREAM_MSG"
+            if [ -z "$msg" ]; then
+                AGENT_ANSWER="Unexpected API response."; hist_save; return 1
+            fi
+            fr="$(jq -r 'if (.tool_calls // []) | length > 0 then "tool_calls" else "stop" end' <<<"$msg")"
+            # never emit a message with neither content nor tool_calls: the API rejects it
+            msg="$(jq -c 'if (has("content") or has("tool_calls")) then . else . + {content:""} end' <<<"$msg")"
+        else
+            resp="$API_RESP"
+            if [ -z "$resp" ]; then
+                AGENT_ANSWER="Network error: ${CURL_ERR:-no response}"; hist_save; return 1
+            fi
+            jq -e . >/dev/null 2>&1 <<<"$resp" || { AGENT_ANSWER="Unexpected API response."; hist_save; return 1; }
+            err="$(jq -r '.error.message // empty' <<<"$resp")"
+            [ -n "$err" ] && { AGENT_ANSWER="API error: $err"; hist_save; return 1; }
+            fr="$(jq -r '.choices[0].finish_reason // "stop"' <<<"$resp")"
+            # strip reasoning_content; keep content+tool_calls
+            msg="$(jq -c '.choices[0].message
+                    | {role:"assistant", content:(.content // null), tool_calls:(.tool_calls // null)}
+                    | with_entries(select(.value != null))
+                    | if (has("content") or has("tool_calls")) then . else . + {content:""} end' <<<"$resp")"
+        fi
         HISTORY="$(printf '%s\n%s\n' "$HISTORY" "$msg" | jq -cs '.[0] + [.[1]]')"
 
         if [ "$fr" = "tool_calls" ]; then
-            n="$(jq '.choices[0].message.tool_calls | length' <<<"$resp")"
+            n="$(jq '(.tool_calls // []) | length' <<<"$msg")"
             for ((j=0; j<n; j++)); do
-                callid="$(jq -r ".choices[0].message.tool_calls[$j].id" <<<"$resp")"
-                cargs="$(jq -r ".choices[0].message.tool_calls[$j].function.arguments" <<<"$resp")"
+                callid="$(jq -r ".tool_calls[$j].id" <<<"$msg")"
+                cargs="$(jq -r ".tool_calls[$j].function.arguments" <<<"$msg")"
                 cmd="$(jq -r '.command // empty' <<<"$cargs" 2>/dev/null)"
-                if [ "$CANCEL" = 1 ]; then
+                if [ -z "$cmd" ]; then
+                    # a reply cut off by max_tokens leaves the arguments unparseable;
+                    # tell the model instead of silently running nothing (idea from
+                    # antonum/bash-harness)
+                    out="ERROR: tool call arguments were not valid JSON — the reply was probably cut off by max_tokens. Use shorter commands, e.g. write large files in several appends."
+                elif [ "$CANCEL" = 1 ]; then
                     out="(stopped by user)"   # keep history valid: every call gets a reply
                 else
                     transcript_add $'\n\n$ '"$cmd"
@@ -238,7 +455,9 @@ ds_agent() {   # $1 = user input -> sets AGENT_ANSWER
             [ "$CANCEL" = 1 ] && { AGENT_ANSWER="(stopped)"; return 1; }
             continue
         fi
-        AGENT_ANSWER="$(jq -r '.choices[0].message.content // "(no content)"' <<<"$resp")"
+        AGENT_ANSWER="$(jq -r '.content // ""' <<<"$msg")"
+        [ -z "$AGENT_ANSWER" ] && AGENT_ANSWER="(no content)"
+        hist_save
         return 0
     done
     AGENT_ANSWER="(stopped after $MAX_ITERS tool iterations)"
@@ -253,6 +472,25 @@ run_bash_tool() {   # $1 = command -> sets TOOL_OUT to "exit=N\n<output>"
     local cmd="$1" of="$TMP_DIR/tool.out" pid ec out
     TOOL_OUT="exit=0"
     [ -z "$cmd" ] && return
+    # audit trail: every command the model runs, and when
+    mkdir -p "$CONFIG_DIR" 2>/dev/null
+    printf '%s\t%s\n' "$(date '+%F %T')" "$cmd" >>"$CMD_LOG" 2>/dev/null
+    # optional gate: risky commands wait for an explicit Run tap in the panel
+    if [ "$CONFIRM_DANGEROUS" = 1 ] && printf '%s' "$cmd" | grep -Eq "$RISKY_PATTERN"; then
+        PENDING=1; APPROVE=0
+        tg_view_text "$aid" "$send_btn" "Run"
+        transcript_add $'\n'"⚠ risky — tap Run to execute, Reset to skip"
+        while [ "$PENDING" = 1 ] && [ "$APPROVE" = 0 ] && [ "$CANCEL" = 0 ]; do
+            busy_pump
+            sleep 0.15
+        done
+        PENDING=0
+        tg_view_text "$aid" "$send_btn" "Stop"
+        if [ "$APPROVE" != 1 ]; then
+            TOOL_OUT="exit=126"$'\n'"(the user declined this command)"
+            return
+        fi
+    fi
     ( cd "$HOME" && exec timeout -k 5 "$CMD_TIMEOUT" bash -c "$cmd" ) </dev/null >"$of" 2>&1 &
     pid=$!
     while kill -0 "$pid" 2>/dev/null; do
@@ -323,6 +561,11 @@ PAD=8
 ROW_W=$((PANEL_W - 2*PAD))      # inner width that rows / buttons share
 ANS_W=$((ROW_W - 8))            # answer text width (so it wraps)
 ANS_H=200                       # answer area height
+DENSITY_DPI="$(/system/bin/getprop ro.sf.lcd_density 2>/dev/null)"
+case "$DENSITY_DPI" in ''|*[!0-9]*) DENSITY_DPI=480 ;; esac
+DENSITY_X=$((DENSITY_DPI / 160))     # dp -> px factor
+[ "$DENSITY_X" -lt 1 ] && DENSITY_X=1
+PANEL_H_DP=400                       # approximate expanded-panel height (dp)
 
 # Panel (hidden until expanded)
 declare -A pp=([$tgc_create_vertical]="true")
@@ -400,6 +643,7 @@ tg_view_gravity    "$aid" "$title" "$tgc_grav_top_left" "$tgc_grav_center"
 tg_view_width "$aid" "$title" 0; tg_view_linear "$aid" "$title" 1
 close_btn="$(mkicon "$title_row" "▽")"
 quit_btn="$(mkicon  "$title_row" "✕")"
+model_btn="$(mkicon "$title_row" "M")"
 hairline "$main_box"
 
 # clipboard action toolbar (acts on the currently-copied text) — smaller text fits
@@ -430,6 +674,7 @@ copy_btn="$(mkbtn  "$ctl_row" "Copy")";  weigh "$copy_btn"
 speak_btn="$(mkbtn "$ctl_row" "Speak")"; weigh "$speak_btn"
 reset_btn="$(mkbtn "$ctl_row" "Reset")"; weigh "$reset_btn"
 
+mic_btn="$(mkbtn "$ctl_row" "Mic")";   weigh "$mic_btn"
 # answer console (scrollable) — distinct dark surface, last
 declare -A scp=()
 scroll="$(tg_create_nested_scroll "$aid" scp "$main_box")"
@@ -447,11 +692,16 @@ tg_view_text_color "$aid" "$answer" "$c_text"
 # ── Transcript management ────────────────────────────────────────────────────
 TRANSCRIPT="› Copy text + tap an action, or type a request. I can run commands on your device."
 LAST_ANSWER=""
+[ "$RESTORED_MSGS" -gt 1 ] && transcript_set "› Restored $((RESTORED_MSGS-1)) messages from the last session.
+$TRANSCRIPT"
 # tg_str_quote can only escape \n and \t — any other control byte (a stray \r,
 # ANSI escapes, or a literal RS, which is the protocol delimiter!) would produce
 # a broken setText message. Strip them before anything reaches the screen.
 transcript_clean() { printf '%s' "$1" | tr -d '\000-\010\013-\037\177'; }
-transcript_set() { TRANSCRIPT="$(transcript_clean "$1")"; tg_view_text "$aid" "$answer" "$TRANSCRIPT"; }
+# scroll the console to the newest line after an update (a huge y is clamped by
+# the ScrollView); the getter is avoided because it can block
+scroll_bottom() { tg_view_set_scroll "$aid" "$scroll" 0 999999 2>/dev/null; }
+transcript_set() { TRANSCRIPT="$(transcript_clean "$1")"; tg_view_text "$aid" "$answer" "$TRANSCRIPT"; scroll_bottom; }
 transcript_add() {
     TRANSCRIPT="$TRANSCRIPT$(transcript_clean "$1")"
     # cap it: every update re-sends the whole text, so an unbounded transcript
@@ -460,6 +710,7 @@ transcript_add() {
         TRANSCRIPT="…${TRANSCRIPT: -$TRANS_LIMIT}"
     fi
     tg_view_text "$aid" "$answer" "$TRANSCRIPT"
+    scroll_bottom
 }
 
 # ── Setup / main toggling ────────────────────────────────────────────────────
@@ -496,8 +747,25 @@ save_key() {
 
 # ── Expand / collapse ────────────────────────────────────────────────────────
 expanded=0
-expand()   { expanded=1; tg_view_vis "$aid" "$bubble" "$tgc_vis_gone";    tg_view_vis "$aid" "$panel" "$tgc_vis_visible"; }
-collapse() { expanded=0; tg_view_vis "$aid" "$panel"  "$tgc_vis_gone";    tg_view_vis "$aid" "$bubble" "$tgc_vis_visible"; }
+# Touch reporting stays enabled while the panel is open: the panel is dragged by
+# its title band (see handle_touch), and the per-sample cost is ~0.27 ms thanks
+# to the fork-free event path. Turning it off would make the panel immovable.
+# Learn the screen extent from real touches — getConfiguration never answers, so
+# a conservative bound from the fingers we have seen is better than none.
+panel_place() {
+    local ph=$((PANEL_H_DP * DENSITY_X)) pw=$((PANEL_W * DENSITY_X)) moved=0
+    if [ "$SCREEN_H_PX" -gt 0 ] && [ "$posY" -gt $((SCREEN_H_PX - ph)) ]; then
+        posY=$((SCREEN_H_PX - ph)); moved=1
+    fi
+    if [ "$SCREEN_W_PX" -gt 0 ] && [ "$posX" -gt $((SCREEN_W_PX - pw)) ]; then
+        posX=$((SCREEN_W_PX - pw)); moved=1
+    fi
+    [ "$posY" -lt 0 ] && posY=0
+    [ "$posX" -lt 0 ] && posX=0
+    [ "$moved" = 1 ] && tg_activity_position "$aid" "$posX" "$posY"
+}
+expand()   { expanded=1; panel_place; tg_view_vis "$aid" "$bubble" "$tgc_vis_gone"; tg_view_vis "$aid" "$panel" "$tgc_vis_visible"; }
+collapse() { expanded=0; tg_view_vis "$aid" "$panel" "$tgc_vis_gone"; tg_view_vis "$aid" "$bubble" "$tgc_vis_visible"; }
 
 # ── Actions ──────────────────────────────────────────────────────────────────
 clip_action() {   # $1 = instruction
@@ -520,6 +788,7 @@ do_send() {
     busy_begin
     ds_agent "$q"            # main-context call so HISTORY persists across turns
     busy_end
+    hist_save                # survive a restart
     LAST_ANSWER="$AGENT_ANSWER"
     transcript_add $'\n\n🤖 '"$AGENT_ANSWER"
 }
@@ -540,25 +809,52 @@ tg_activity_position "$aid" "$posX" "$posY"
 # ── Screen bounds (so the bubble can't be dragged off-screen) ────────────────
 SCREEN_W_PX=0; SCREEN_H_PX=0
 update_screen_bounds() {
-    local conf w h d
-    conf="$(tg_activity_configuration "$aid" 2>/dev/null)" || return 0
-    w="$(jq -r '.screenwidth  // 0' <<<"$conf" 2>/dev/null)" || return 0
-    h="$(jq -r '.screenheight // 0' <<<"$conf" 2>/dev/null)" || return 0
-    d="$(jq -r '.density // 1' <<<"$conf" 2>/dev/null)" || return 0
-    # configuration is in dp; positions/touches are in px
-    SCREEN_W_PX="$(awk -v w="$w" -v d="$d" 'BEGIN{printf "%d", w*d}' 2>/dev/null || echo 0)"
-    SCREEN_H_PX="$(awk -v h="$h" -v d="$d" 'BEGIN{printf "%d", h*d}' 2>/dev/null || echo 0)"
+    # getConfiguration is not answered by this Termux:GUI build, and the timed
+    # read could swallow a pending reply, so screen bounds are learned from real
+    # touches instead (see touch_apply / panel_place). Hook kept for the config
+    # event: nothing to do.
+    :
 }
 update_screen_bounds
 
+# ── Event plumbing (fork-free) ───────────────────────────────────────────────
+# tg_event_type/tg_event_id spawn a jq process per event. On a drag that is one
+# fork per touch sample — the main reason the bubble felt sluggish. Everything
+# below the socket read is regex on the string we already have.
+EV=""; EV_TYPE=""; EV_ID=""; _ev_probe=""
+ev_parse() {   # $1 = raw event JSON -> sets EV_TYPE, and EV_ID for clicks
+    EV="$1"; EV_TYPE=""; EV_ID=""
+    [[ $EV =~ \"type\":\"([A-Za-z_]+)\" ]] && EV_TYPE=${BASH_REMATCH[1]}
+    [ "$EV_TYPE" = "click" ] && [[ $EV =~ \"id\":([0-9]+) ]] && EV_ID=${BASH_REMATCH[1]}
+}
+ev_ready() {   # probe only: succeeds when an event is queued, consumes nothing
+    IFS= read -t 0 -r -s -d $'\x1e' -u "${tg__event[0]}" _ev_probe
+}
+recv_ev() {    # blocking read straight into EV (no $(...) → no subshell per event)
+    IFS= read -r -s -d $'\x1e' -u "${tg__event[0]}" EV
+}
+
 # ── Drag handling (collapsed only) ───────────────────────────────────────────
-dsx=0; dsy=0; spx=0; spy=0; moved=0
-handle_touch() {   # $1 = raw event JSON; parsed with regex (hot path, no jq)
-    local ev="$1" x=0 y=0 a="" dx dy adx ady maxx maxy
-    [[ $ev =~ \"x\":(-?[0-9]+) ]]      && x=${BASH_REMATCH[1]}
-    [[ $ev =~ \"y\":(-?[0-9]+) ]]      && y=${BASH_REMATCH[1]}
-    [[ $ev =~ \"action\":\"([a-z_]+)\" ]] && a=${BASH_REMATCH[1]}
-    [ "$expanded" = 1 ] && return    # don't move the window while the panel is open
+dsx=0; dsy=0; spx=0; spy=0; moved=0; LSPX=-1; LSPY=-1; PANEL_DRAG=0
+send_pos() {   # one setPosition per batch, and only when the position changed
+    if [ "$posX" != "$LSPX" ] || [ "$posY" != "$LSPY" ]; then
+        LSPX=$posX; LSPY=$posY
+        tg_activity_position "$aid" "$posX" "$posY"
+    fi
+}
+clamp_pos() {
+    [ "$posX" -lt 0 ] && posX=0
+    [ "$posY" -lt 0 ] && posY=0
+    if [ "$SCREEN_W_PX" -gt "$EDGE_KEEP" ]; then
+        [ "$posX" -gt "$((SCREEN_W_PX - EDGE_KEEP))" ] && posX=$((SCREEN_W_PX - EDGE_KEEP))
+        [ "$posY" -gt "$((SCREEN_H_PX - EDGE_KEEP))" ] && posY=$((SCREEN_H_PX - EDGE_KEEP))
+    fi
+}
+touch_apply() {   # $1=x $2=y $3=action — apply one touch sample
+    local x="$1" y="$2" a="$3" dx dy adx ady
+    # learn the screen extent (getConfiguration is unanswered on this build)
+    [ "$x" -gt "$SCREEN_W_PX" ] && SCREEN_W_PX=$x
+    [ "$y" -gt "$SCREEN_H_PX" ] && SCREEN_H_PX=$y
     case "$a" in
         down) dsx=$x; dsy=$y; spx=$posX; spy=$posY; moved=0 ;;
         move)
@@ -566,45 +862,125 @@ handle_touch() {   # $1 = raw event JSON; parsed with regex (hot path, no jq)
             adx=${dx#-}; ady=${dy#-}
             { [ "$adx" -gt 15 ] || [ "$ady" -gt 15 ]; } && moved=1
             posX=$((spx+dx)); posY=$((spy+dy))
-            [ "$posX" -lt 0 ] && posX=0
-            [ "$posY" -lt 0 ] && posY=0
-            if [ "$SCREEN_W_PX" -gt "$EDGE_KEEP" ]; then
-                maxx=$((SCREEN_W_PX - EDGE_KEEP)); maxy=$((SCREEN_H_PX - EDGE_KEEP))
-                [ "$posX" -gt "$maxx" ] && posX=$maxx
-                [ "$posY" -gt "$maxy" ] && posY=$maxy
-            fi
-            tg_activity_position "$aid" "$posX" "$posY"
+            clamp_pos
+            send_pos
             ;;
-        up) [ "$moved" = 0 ] && expand ;;
+        up)
+            dx=$((x-dsx)); dy=$((y-dsy))
+            posX=$((spx+dx)); posY=$((spy+dy))
+            clamp_pos
+            send_pos
+            [ "$moved" = 0 ] && [ "$expanded" = 0 ] && expand
+            PANEL_DRAG=0
+            ;;
+    esac
+}
+handle_touch() {   # $1 = raw event JSON (regex only: hot path)
+    local ev="$1" x=0 y=0 a="" a2="" lx ly la drained=0
+    # the app reports touches as floats ("x":164.00879) — keep the integer part
+    [[ $ev =~ \"x\":(-?[0-9]+)(\.[0-9]+)? ]] && x=${BASH_REMATCH[1]}
+    [[ $ev =~ \"y\":(-?[0-9]+)(\.[0-9]+)? ]] && y=${BASH_REMATCH[1]}
+    [[ $ev =~ \"action\":\"([a-z_]+)\" ]] && a=${BASH_REMATCH[1]}
+    # Collapsed: the whole bubble drags. Expanded: only a gesture that starts in
+    # the panel's title band moves the window, so the text stays scrollable.
+    if [ "$expanded" = 1 ]; then
+        if [ "$a" = "down" ]; then
+            if [ $((y - posY)) -ge 0 ] && [ $((y - posY)) -le $((52 * DENSITY_X)) ]; then
+                PANEL_DRAG=1
+            else
+                PANEL_DRAG=0
+            fi
+        fi
+        [ "${PANEL_DRAG:-0}" = 1 ] || return
+    fi
+    touch_apply "$x" "$y" "$a"
+
+    # Coalesce the burst the app queued while we were busy: apply only the newest
+    # sample so the bubble tracks the finger instead of replaying a backlog.
+    lx=$x; ly=$y; la=$a
+    while [ "$drained" -lt 60 ] && ev_ready; do
+        drained=$((drained+1))
+        recv_ev || break
+        if [[ $EV =~ \"action\":\"([a-z_]+)\" ]]; then
+            a2=${BASH_REMATCH[1]}
+            [[ $EV =~ \"x\":(-?[0-9]+)(\.[0-9]+)? ]] && lx=${BASH_REMATCH[1]}
+            [[ $EV =~ \"y\":(-?[0-9]+)(\.[0-9]+)? ]] && ly=${BASH_REMATCH[1]}
+            la=$a2
+        else
+            ev_parse "$EV"
+            case "$EV_TYPE" in
+                click)   handle_click "$EV_ID" ;;
+                destroy) exit 0 ;;
+                config)  update_screen_bounds ;;
+            esac
+        fi
+    done
+    [ "$drained" -gt 0 ] && touch_apply "$lx" "$ly" "$la"
+}
+
+# ── Click handling (shared by the event loop and the busy pump) ──────────────
+handle_click() {   # $1 = view id
+    local id="$1"
+    # while a request/tool run is in flight only these clicks make sense; anything
+    # else would nest another API call inside the running one
+    if [ "$BUSY" = 1 ]; then
+        case "$id" in
+            "$send_btn")  if [ "$PENDING" = 1 ]; then APPROVE=1; else CANCEL=1; toast "Stopping…"; fi; return ;;
+            "$reset_btn") if [ "$PENDING" = 1 ]; then APPROVE=-1; else CANCEL=1; toast "Stopping…"; fi; return ;;
+            "$quit_btn"|"$close_btn"|"$copy_btn"|"$speak_btn") ;;
+            *) return ;;
+        esac
+    fi
+    case "$id" in
+        "$close_btn") collapse ;;
+        "$quit_btn")  tg_activity_finish "$aid"; exit 0 ;;
+        "$send_btn")  do_send ;;
+        "$reset_btn") hist_clear; transcript_set "Conversation reset." ;;
+        "$model_btn")
+            case "$DEEPSEEK_MODEL" in
+                deepseek-flash) DEEPSEEK_MODEL="deepseek-v4-pro" ;;
+                *)              DEEPSEEK_MODEL="deepseek-flash" ;;
+            esac
+            save_config
+            toast "Model: $DEEPSEEK_MODEL"
+            transcript_add $'\n'"⚙ model → $DEEPSEEK_MODEL"
+            ;;
+        "$mic_btn")
+            transcript_add $'\n'"🎤 listening…"
+            local raw spk
+            raw="$(timeout 45 termux-speech-to-text 2>/dev/null)"
+            spk="$(printf '%s' "$raw" | jq -r 'if type == "object" then (.text // empty) else . end' 2>/dev/null)"
+            [ -z "$spk" ] && spk="$raw"
+            if [ -n "$spk" ]; then
+                tg_view_text "$aid" "$input" "$spk"
+                transcript_add $'\n'"🎤 $spk"
+            else
+                transcript_add $'\n'"🎤 (nothing recognised)"
+            fi
+            ;;
+        "$copy_btn")  [ -n "$LAST_ANSWER" ] && { printf '%s' "$LAST_ANSWER" | termux-clipboard-set 2>/dev/null; toast "Copied"; } ;;
+        "$speak_btn") [ -n "$LAST_ANSWER" ] && termux-tts-speak "$LAST_ANSWER" >/dev/null 2>&1 & ;;
+        "$setup_paste") tg_view_text "$aid" "$setup_input" "$(termux-clipboard-get 2>/dev/null)" ;;
+        "$setup_save")  save_key ;;
+        "$act_tr")    clip_action "Translate the following text to English (or to the user's language if it is already English). Output only the translation" ;;
+        "$act_sum")   clip_action "Summarize the following text in a few bullet points" ;;
+        "$act_exp")   clip_action "Explain the following clearly and simply" ;;
+        "$act_fix")   clip_action "Fix the spelling and grammar of the following text. Output only the corrected text" ;;
+        "$act_reply") clip_action "Write a friendly, appropriate reply to the following message" ;;
+    esac
+}
+handle_event() {   # $1 = raw event JSON
+    ev_parse "$1"
+    case "$EV_TYPE" in
+        destroy) exit 0 ;;                 # activity killed → don't linger as an orphan
+        config)  update_screen_bounds ;;    # rotation etc. changes the clamp box
+        overlayTouch) handle_touch "$1" ;;
+        click)   handle_click "$EV_ID" ;;
     esac
 }
 
 # ── Event loop ───────────────────────────────────────────────────────────────
-while true; do
-    ev="$(tg_msg_recv_event_blocking)" || break
-    etype="$(tg_event_type "$ev")"
-    case "$etype" in
-        destroy) break ;;                       # activity killed → don't linger as an orphan
-        config)  update_screen_bounds ;;        # rotation etc. changes the clamp box
-        overlayTouch) handle_touch "$ev" ;;
-        click)
-            id="$(tg_event_id "$ev")"
-            case "$id" in
-                "$close_btn") collapse ;;
-                "$quit_btn")  tg_activity_finish "$aid"; exit 0 ;;
-                "$send_btn")  do_send ;;
-                "$copy_btn")  [ -n "$LAST_ANSWER" ] && { printf '%s' "$LAST_ANSWER" | termux-clipboard-set 2>/dev/null; toast "Copied"; } ;;
-                "$speak_btn") [ -n "$LAST_ANSWER" ] && termux-tts-speak "$LAST_ANSWER" >/dev/null 2>&1 & ;;
-                "$reset_btn") HISTORY='[]'; transcript_set "Conversation reset." ;;
-                "$setup_paste") tg_view_text "$aid" "$setup_input" "$(termux-clipboard-get 2>/dev/null)" ;;
-                "$setup_save")  save_key ;;
-                "$act_tr")    clip_action "Translate the following text to English (or to the user's language if it is already English). Output only the translation" ;;
-                "$act_sum")   clip_action "Summarize the following text in a few bullet points" ;;
-                "$act_exp")   clip_action "Explain the following clearly and simply" ;;
-                "$act_fix")   clip_action "Fix the spelling and grammar of the following text. Output only the corrected text" ;;
-                "$act_reply") clip_action "Write a friendly, appropriate reply to the following message" ;;
-            esac
-            ;;
-    esac
+while recv_ev; do
+    handle_event "$EV"
 done
 exit 0
