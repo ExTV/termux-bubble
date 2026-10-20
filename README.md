@@ -54,8 +54,35 @@ You also need a **DeepSeek API key** from <https://platform.deepseek.com>.
 - **Clipboard actions** — copy text, then tap *Trans / Sum / Expl / Fix / Reply*.
 - **Chat** — type a request and **Send**. The model can run bash commands on your phone
   (read files, fetch things, run programs) to complete the task.
+- While it's working, **Send** turns into **Stop** — tap it to cancel the current run.
+  Collapse, drag, Copy/Speak and quit keep working during a run.
 - **Copy / Speak** the last answer, **Reset** the conversation, **▽** collapse, **✕** quit.
+- **Mic** dictates into the input box (Termux:API speech recognition).
+- **M** switches the model between `deepseek-flash` and `deepseek-v4-pro`.
+- Answers stream in as they are generated, and the console auto-scrolls to the newest line.
+- The conversation is saved to `~/.config/deepseek-bubble/history.json` and restored on the
+  next launch; **Reset** clears it.
+
+## Configuration
+
+Everything lives in `~/.config/deepseek-bubble/config` (created on first save, `chmod 600`):
+
+| Key | Default | Meaning |
+|---|---|---|
+| `DEEPSEEK_API_KEY` | — | your key (an env var of the same name wins) |
+| `DEEPSEEK_MODEL` | `deepseek-flash` | model id; `deepseek-v4-pro` is the bigger one |
+| `DEEPSEEK_API_URL` | `https://api.deepseek.com/chat/completions` | any OpenAI-compatible endpoint |
+| `DEEPSEEK_MAX_TOKENS` | `8000` | output cap per reply |
+| `DEEPSEEK_THINKING` | `off` | `off` (fast, no reasoning pass), `on`, or `default` (server decides; for `deepseek-flash` that currently means **on**, so only `off` changes anything) |
+| `BASH_CONFIRM` | `0` | `1` = risky commands wait for a **Run** tap |
+
+Only `DEEPSEEK_API_KEY` is required. Every command the model runs is appended to
+`~/.config/deepseek-bubble/cmd.log` with a timestamp, whether or not `BASH_CONFIRM` is on.
+
+Because the endpoint is configurable, the bubble also works with a local or LAN model server
+(llama.cpp, vLLM, Ollama, OpenRouter, …) as long as it speaks the OpenAI chat-completions API
+and supports tool calling.
 
 ## License
 
-See [LICENSE](LICENSE).
+GPL-3.0 — see [LICENSE](LICENSE).
